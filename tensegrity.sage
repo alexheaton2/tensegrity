@@ -1,233 +1,566 @@
 class Truss:
-    
-    def __init__(self, dim=3):
+
+    def __init__(self, nodes, edges, node_coordinates={}, dim=3, orthonormal=False):
+        self.tolerance = 1e-30
+        self.orthonormal = orthonormal
+        self.ring_choice = AA # could try RR or RealField(400) or AA or QQbar or CC or ComplexField(400) or RDF or CDF or SR or QQ
         self.dim = dim
-        self.nodes = []
-        self.bars = []
-        self.forces = []
+        self.nodes = nodes # should be [1,2,3,4,5] etc. not anything crazy like [0,1,2,3,4] or [1,2,5,19,12]
+        self.edges = edges # should be [(1,2),(1,4),...] etc.
+        self.X = matrix(len(self.nodes),dim,[var('x%s%s'%(node,j)) for node in nodes for j in range(1,dim+1)]) # one row for each node
+        self.node_coordinates = node_coordinates # dictionary, the user needs to fill this with initial configuration "p" coordinates
+        self.node_indices = self.create_node_indices() # key:val is "1:[0,1,2], 2:[3,4,5],..." giving the column indices of "A0" matrix
+        self.edge_indices = self.create_edge_indices() # key:val is "(1,2):0, (1,3):1, ..." giving row indices in "A0" matrix
+        self.p0 = self.vector_from_node_coordinates()
+        self.edge_lengths_squared = {} # fill this dictionary during "create_bar_constraints"
+        self.potential = 0
+        self.bar_constraints = self.create_bar_constraints()
+        self.rigidity_matrix = self.create_rigidity_matrix()
+        self.rigidity_matrix_at_p = self.create_rigidity_matrix_at_p()
+        self.leftnullspace = self.create_leftnullspace()
+        self.right_nullspace = self.create_right_nullspace()
+        self.stress_matrices = self.create_stress_matrices()
         self.fixed_nodes = []
-        self.fixed_columns = []
-        self.C = []
-        self.A0 = []
-        self.A = []
-        self.f0 = []
-        self.f = []
-        self.b0 = []
-        self.b = []
-        self.K = []
-        self.before = Graphics()
-        self.after = Graphics()
+        self.unfixed_node_indices = self.create_node_indices() # If fix node 2, update key:val is "1:[0,1,2], 2:[], 3:[3,4,5], ..." gives column indices
+        self.A0created = False
+        self.A0 = [] # need to wait and create this after "node_coordinates" has been filled
+        self.A = [] # need to wait and create this once we "fix_nodes"
+        self.before = self.plot() # this is just the framework alone. No mechanisms etc.
+        self.mechanism_plot = Graphics()
+        self.flexes_plot = Graphics()
+        self.rigid_motions_plot = Graphics()
+        self.number_mechanisms = 0
+        #self.mechanisms = {} # the keys will be 0,1,2... depending on how many linearly independent mechanisms we have
+        self.translations = self.create_translations()
+        self.rotations = self.create_rotations()
+        self.rigid_motions = self.translations + self.rotations
+        self.flexes = self.create_flexes()
+        self.mechanisms = self.rigid_motions + self.flexes
+        self.translation_sections = self.create_translation_sections()
+        self.rotation_sections = self.create_rotation_sections()
+        self.flex_sections = self.create_flex_sections()
+        self.plot_arrow_scale = 1/3 # default setting, feel free to change this.
+        self.barycentric_node_coordinates = self.create_barycentric_node_coordinates()
+        self.barycentric_rotations = self.create_barycentric_rotations() # ask for it if you need it.
+        self.barycentric_flexes = self.create_barycentric_flexes() # ask for it if you need it.
 
-    # Add bar by specifying two end points and the material constant
-    def add_bar(self, pt1, pt2, mat_const):
-        if pt1 not in self.nodes:
-            self.nodes.append(pt1)
-        if pt2 not in self.nodes:
-            self.nodes.append(pt2)
-        bar = {'nd1':self.nodes.index(pt1), 'nd2':self.nodes.index(pt2), 'mat_const':mat_const}
-        self.bars.append(bar)
+    def create_node_indices(self):
+        # OUTPUT: a dictionary
+        # key:val is "1:[0,1,2], 2:[3,4,5],..." giving the column indices of "A0" matrix
+        node_indices = {}
+        for i,node in enumerate(self.nodes): # in case they do something silly like nodes=[1,5,6,19], this still works
+            node_indices[node] = [self.dim*i + j for j in range(self.dim)]
+        return node_indices
 
-    # Add force by specifying pt at which force acts and tuple force
-    def add_force(self, pt, force):
-        if pt in self.nodes:
-            self.forces.append({'nd':self.nodes.index(pt), 'force':force})
+    def create_edge_indices(self):
+        # OUTPUT: a dictionary
+        # key:val is "(1,2):0, (1,3):1, ..." giving row indices in "A0" matrix
+        edge_indices = {}
+        for i,edge in enumerate(self.edges):
+            edge_indices[edge] = i
+        return edge_indices
 
-    # Fix an end point of a bar by specifying point pt and tuple of dimensions to fix - fixed_dims
-    def fix_node(self, pt, fixed_dims):
-        if len(fixed_dims) != self.dim:
-            raise NameError('fixed_dims tuple length not equal to dimension of space')
-        if pt in self.nodes:
-            self.fixed_nodes.append({'nd':self.nodes.index(pt), 'fixed_dims':fixed_dims})
-
-    # Creates a graphics object for the Truss. Red nodes fixed in all directions. Yellow fixed in one direction. White free.
-    def graphic(self, before=True, show=False):
-        plt = Graphics()
-        # different colors before and after
-        if before==True:
-            color = 'lightblue'
-        else:
-            color = 'darkblue'
-        # ensure the origin is in the picture, looks better usually
-        plt += point(self.dim*[0], size=1)
-        # plot the fixed nodes in RED
-        for node in self.fixed_nodes:
-            plt += point(self.nodes[node['nd']], color='red', size=25)
-        # plot the bars in 'color'
-        for bar in self.bars:
-            nd1, nd2 = self.nodes[bar['nd1']], self.nodes[bar['nd2']]
-            plt += line([nd1, nd2], color=color)
-        # plot the force vector and its point BLUE
-        if before==True:
-            for force in self.forces:
-                 nd, frc = self.nodes[force['nd']], force['force']
-                 end = vector(nd)+ vector(frc)
-                 plt += arrow(nd, end)
-                 plt += point(nd, color='blue', size=25)
-        return plt
-    
-    # create all the matrices and vectors, but DO NOT ATTEMPT SOLVING
-    def compute(self, show=False):
-        self.A0 = self.create_A0()
-        self.f0 = self.create_f0()
-        self.fixed_columns = self.fixed_matrix_columns()
-        self.A = (self.A0).matrix_from_columns([i for i in range(self.A0.ncols()) if i not in self.fixed_columns])
-        self.f = vector(RR, [self.f0[i] for i in range(len(self.f0)) if i not in self.fixed_columns])
-        self.C = self.create_C()
-        self.K = self.A.transpose()*self.C*self.A
-        self.before = t.graphic()
-        if show:
-            print 'A0 is rank {} with {} rows and {} cols.'.format(self.A0.rank(), self.A0.nrows(), self.A0.ncols())
-            print 'A is rank {} with {} rows and {} cols.'.format(self.A.rank(), self.A.nrows(), self.A.ncols())
-            print 'K is rank {} with {} rows and {} cols.'.format(self.K.rank(), self.K.nrows(), self.K.ncols())
-        
-    # Given list of node displacement vectors "node_displacements", updates Truss node positions.
-    def displace_nodes(self, node_displacements):
+    def vector_from_node_coordinates(self):
+        # OUTPUT: a vector of length n*d, contains all coordinates of all nodes
         n = len(self.nodes)
-        for i in range(n):
-            nd = self.nodes[i]
-            nd = tuple(vector(nd) + node_displacements[i])
-            self.nodes[i] = nd
-    
-    # HELPER FUNCTIONS for truss.compute()
-    def create_A0(self):
-        N = self.dim*len(self.nodes)
-        rows = []
-        for bar in self.bars:
-
-            # Initialize bar variables
-            nd1_index, nd2_index = bar['nd1'], bar['nd2']
-            nd1, nd2 = vector(self.nodes[nd1_index]), vector(self.nodes[nd2_index])
-            row = vector(RR, {N-1:0})
-
-            # Calculate unit vector pointing from node 1 to node 2.
-            X = (nd2 - nd1)/(nd2-nd1).norm()
-
-            for i in range(self.dim):
-                row[self.dim*nd1_index + i] = X[i]
-                row[self.dim*nd2_index + i] = -X[i]
-
-            rows.append(row)
-        return matrix(rows)
-    
-    def fixed_matrix_columns(self):
-        indexes = []
-        for node in self.fixed_nodes:
-            nd_index = node['nd']
-            fixed_dims = node['fixed_dims']
-            for i in range(self.dim):
-                if fixed_dims[i]:
-                    indexes.append(self.dim*nd_index + i)
-        return indexes
-
-    def create_C(self):
-        m = len(self.bars)
-        rows = []
-        for i in range(m):
-            row = vector(RR, {m-1:0})
-            row[i] = self.bars[i]['mat_const']
-            rows.append(row)
-        return matrix(rows)
-
-    def create_f0(self):
-        N = self.dim*len(self.nodes)
-        f0 = vector(RR, {N-1:0})
-        for force in self.forces:
-            nd_index = force['nd']
-            frc = force['force']
-            for i in range(self.dim):
-                f0[self.dim*nd_index+i] = frc[i]
-        return f0
-
-    def create_x0(self, x, fixed_columns):
-        N = self.dim*len(self.nodes)
-        x0 = vector(RR, {N-1:0})
-        j = 0
-        for i in range(N):
-            if i not in fixed_columns:
-                x0[i] = x[j]
-                j += 1
-        return x0
-
-    def solve_truss(self):
-        x = self.K.solve_right(self.f)
-        y = self.C*self.A*x
-        return self.create_x0(x, self.fixed_columns), y
-    
-    def solve(self):
-        x0, y = self.solve_truss()
-        self.displace_nodes(self.create_displ_vectors(x0))
-        self.after = self.graphic(before=False)
-
-    def create_displ_vectors(self, x0):
-        n = len(self.nodes)
-        nds_disp = []
-        for nd_index in range(n):
-            node_displ = vector(RR, {self.dim-1:0})
-            for i in range(self.dim):
-                node_displ[i] = x0[self.dim*nd_index + i]
-            nds_disp.append(node_displ)
-        return nds_disp
-
-class VarTruss:
-
-    def __init__(self, nodes, edges, dim=3):
-        self.dim = dim
-        self.nodes = nodes # should be [0,1,2,...] starting from 0
-        self.edges = edges # should be [(1,3),(0,4),...] tuples of endpoints
-        self.X = matrix(len(nodes),dim,[var('x%s%s'%(i,j)) for i in range(1,len(nodes)+1) for j in range(1,dim+1)])
-        self.A0 = self.create_A0()
-        self.A = []
-
-    def create_A0(self):
-        rows = []
-        for edge in self.edges:
-            row = []
-            for i in self.nodes:
-                if i == edge[0]:
-                    row += list(self.X[edge[0]-1] - self.X[edge[1]-1]) # minus 1 because indices start 0,1,2... but we use 1,2,3...
-                elif i == edge[1]:
-                    row += list(self.X[edge[1]-1] - self.X[edge[0]-1]) # minus 1 because indices start 0,1,2... but we use 1,2,3...
-                else:
-                    row += self.dim*[0]
-            rows.append(row)
-        return matrix(rows)
-
-    def set_location(self, spot, loc): # loc = (2,3,-0.3) of the correct dimension
-        if len(loc) != self.dim:
-            raise NameError('...your dimensions are off.')
-        for i in range(self.dim):
-            self.A0 = self.A0( {self.X[spot-1,i]:loc[i]} ) # indices off by 1 since 0,1,2,... not 1,2,3,...
-
-    def fix_nodes(self, fixed_nodes): # fixed_nodes should be a list like [0,2,4] which would leave nodes 1 and 3 free
-        cols = []
+        d = self.dim
+        p0 = vector(self.ring_choice,[0]*(n*d))
         for node in self.nodes:
-            if node not in fixed_nodes:
-                cols += [3*(node-1), 3*(node-1) + 1, 3*(node-1) + 2]
-        self.A = self.A0.matrix_from_columns(cols)
-        
-def left_nullspace_ideal(M):
-    eqns = []
-    if M.nrows() > M.ncols():
-        print 'This matrix has a left nullspace since it has more rows than columns. But we will find maximal minors anyway, because perhaps you see zero rows that you are ignoring for some reason.'
-    k = min(M.nrows(), M.ncols())
-    eqns = M.minors(k)
-    return eqns
+            indices = self.node_indices[node]
+            for i,ind in enumerate(indices):
+                p0[ind] = self.node_coordinates[node][i]
+        return p0
 
-def associated_primes(M, xvars, minimal=True):
-    R = PolynomialRing(QQ, xvars)
-    eqns = left_nullspace_ideal(M)
-    eqns = [R(f) for f in eqns if f!=0]
-    print 'There are %s nonzero equations to start with.'%(len(eqns))
-    print ''
-    I = R.ideal(eqns)
-    if minimal:
-        MAP = I.minimal_associated_primes()
-        for p in MAP:
-            print p.ngens(), p.gens()
-            print ''
-        return MAP
-    else:
-        AP = I.associated_primes()
-        for p in AP:
-            print p.ngens(), p.gens()
-        return AP
+    def create_bar_constraints(self):
+        # OUTPUT: a dictionary
+        # key:val example is "(1,2):symbolic expression giving the squared edge length equation"
+        bar_constraints = {}
+        potential = 0 # also creates the potential energy function Q_w
+        for edge in self.edges:
+            n1,n2 = edge
+            final_minus_initial = vector(self.node_coordinates[n1]) - vector(self.node_coordinates[n2])
+            squared_distance = final_minus_initial*final_minus_initial
+            self.edge_lengths_squared[edge] = squared_distance
+            constraint = SR(0) - squared_distance # initialize
+            squared_length = SR(0) # initialize
+            for i in range(dim):
+                constraint += (self.X[n1-1,i] - self.X[n2-1,i])^2
+                squared_length += (self.X[n1-1,i] - self.X[n2-1,i])^2
+            bar_constraints[edge] = constraint
+            #squared_length = sqrt(squared_length)
+            squared_length -= squared_distance
+            squared_length = var('w%s%s'%edge) * squared_length
+            potential += squared_length
+        self.potential = potential
+        return bar_constraints
+
+    def create_rigidity_matrix(self):
+        # OUTPUT: 1/2 the Jacobian of the bar constraint equations. This is equivalent to Gilbert's incidence matrix A with denominators cleared.
+        #         This matrix has entries which are symbolic expressions
+        #         For the matrix with scalars, use self.rigidity_matrix_at_p
+        eqns = []
+        for edge in self.edges:
+            eqn = self.bar_constraints[edge]
+            eqns.append(eqn)
+        J = jacobian(eqns, self.X.list()) # if we start fixing nodes, this becomes wrong
+        J = 1/2*J
+        return J
+    
+    def create_rigidity_matrix_at_p(self):
+        subz = {var('x%s%s'%(i,k)):self.node_coordinates[i][k-1] for i in range(1,len(self.nodes)+1) for k in range(1,self.dim+1)}
+        return (self.rigidity_matrix).subs(subz)
+
+    def create_translations(self):
+        # OUTPUT: a list of vectors. Each vector has length n*d in the right nullspace of A, a translation.
+        translations = []
+        for i in range(self.dim): # one translation vector for every dimension
+            u = [0]*(self.dim*len(self.nodes)) # initialize
+            for node in self.nodes: # each node gets translated
+                indices = self.node_indices[node]
+                one_index = indices[i]
+                u[one_index] = 1 # only one "1" for each node
+            u = vector(self.ring_choice,u)
+            if self.orthonormal:
+                u = u / u.norm()
+            translations.append(u)
+        return translations
+
+    def create_rotations(self):
+        # OUTPUT: a list of vectors. Each vector has length n*d, in right nullspace of A, a rotation.
+        rotations = []
+        for i in range(self.dim):
+            for j in range(self.dim):
+                if j>i: # one rotation for each upper triangular entry, skew-symm matrix(3,3,[0,1,0, -1,0,0, 0,0,0])
+                    u = [0]*(len(self.nodes)*self.dim)
+                    for node in self.nodes:
+                        indices = self.node_indices[node]
+                        # extract the jth coordinate, and put it in the ith coordinate
+                        u[indices[i]] = self.node_coordinates[node][j]
+                        # extract the ith coordinate, and put -it in the jth coordinate
+                        u[indices[j]] = -(self.node_coordinates[node][i])
+                    u = vector(self.ring_choice,u)
+                    if self.orthonormal:
+                        u = u / u.norm()
+                    rotations.append(u)
+        return rotations
+
+    def create_flexes(self):
+        # OUTPUT: a list of vectors. Each vector has length n*d, in the right nullspace of A, not a translation nor a rotation.
+        if not self.A0created:
+            self.create_A0() # also creates self.A
+        flexes = []
+        nullspace = (self.A).right_kernel_matrix()
+        rigid_motions = matrix(self.ring_choice,self.rigid_motions)
+        rigid_motions = rigid_motions.gram_schmidt()[0]
+        for v in nullspace:
+            v = vector(self.ring_choice,v)
+            for b in rigid_motions:
+                b = vector(self.ring_choice,b)
+                v -= b.dot_product(v)*b / b.dot_product(b)
+            for b in flexes:
+                b = vector(self.ring_choice,b)
+                v -= b.dot_product(v)*b / b.dot_product(b)
+            if v.norm() > self.tolerance:
+                flexes.append(v)
+        return flexes
+
+    def create_A0(self):
+        if len(self.node_coordinates.keys()) != len(nodes):
+            raise NameError('...you need to give node coordinates before we can compute the A0 matrix.')
+        A0 = matrix.zero(len(edges),self.dim*len(nodes)) # matrix full of zeros, correct size
+        A0 = A0.change_ring(self.ring_choice)
+        for edge in self.edges:
+            node0 = edge[0] # initial
+            node1 = edge[1] # final
+            finalminusinitial = vector(self.node_coordinates[node1]) - vector(self.node_coordinates[node0])
+            finalminusinitial = finalminusinitial.normalized() # unit vector
+            i = self.edge_indices[edge]
+            # node0 initial
+            js = self.node_indices[node0]
+            for d,j in enumerate(js):
+                A0[i,j] = list(finalminusinitial)[d]
+            # node1 final
+            js = self.node_indices[node1]
+            for d,j in enumerate(js):
+                A0[i,j] = list(-finalminusinitial)[d]
+        self.A0 = A0
+        self.A0created = True
+        self.A = A0 # until we fix nodes, we might as well have this matrix available
+
+    def gs(self,A,orthonormal=False):
+        # my own version of gram schmidt
+        # OUTPUT: a list of vectors, orthogonal or orthonormal basis for the row space of A
+        # INPUT: a matrix "A" whose row space we will compute
+        basis = [] # fill this list with orthogonal or orthonormal vectors
+        rows = A.rows()
+        for row in rows:
+            row = vector(self.ring_choice,row)
+            for b in basis:
+                row = row - b.dot_product(row)*b / (b.dot_product(b))
+            if row.norm() > self.tolerance:
+                if orthonormal:
+                    row = row / row.norm()
+                if self.orthonormal:
+                    row = row / row.norm()
+                basis.append(row)
+        return basis
+
+    def create_translation_sections(self):
+        # OUTPUT: a list of dictionaries, keys are nodes, vals are tuples, vectors attached at that node
+        translation_sections = []
+        for u in self.translations:
+            section = {}
+            for node in self.nodes:
+                indices = self.node_indices[node]
+                v = [u[i] for i in indices]
+                section[node] = vector(self.ring_choice, v)
+            translation_sections.append(section)
+        return translation_sections
+
+    def create_flex_sections(self):
+        # OUTPUT: a list of dictionaries, keys are nodes, vals are tuples, vectors attached at that node
+        flex_sections = []
+        for u in self.flexes:
+            section = {}
+            for node in self.nodes:
+                indices = self.node_indices[node]
+                v = [u[i] for i in indices]
+                section[node] = vector(self.ring_choice,v)
+            flex_sections.append(section)
+        return flex_sections
+
+    def create_rotation_sections(self):
+        # OUTPUT: a list of dictionaries, keys are nodes, vals are tuples, vectors attached at that node
+        rotation_sections = []
+        for u in self.rotations:
+            section = {}
+            for node in self.nodes:
+                indices = self.node_indices[node]
+                v = [u[i] for i in indices]
+                section[node] = vector(self.ring_choice, v)
+            rotation_sections.append(section)
+        return rotation_sections
+    
+    def get_incidence_matrix(self):
+        # OUTPUT: the m \times n incidence matrix of the graph structure alone
+        n = len(self.nodes)
+        m = len(self.edges)
+        d = self.dim
+        A = matrix.zero(m,n)
+        for (i,j) in self.edges:
+            row_ind = self.edge_indices[(i,j)]
+            A[row_ind, i-1] = 1
+            A[row_ind, j-1] = -1 # choice of 1 or -1 doesn't matter because we do A^T A
+        return A
+    
+    def get_weighted_graph_laplacian(self):
+        A = self.get_incidence_matrix()
+        wvarz = [var('w%s%s'%e) for e in self.edges]
+        C = matrix.diagonal(wvarz)
+        wgl = A.T * C * A # weighted graph laplacian
+        return wgl
+    
+    def get_stress_matrix(self):
+        wgl = self.get_weighted_graph_laplacian()
+        wglKRON = wgl.tensor_product(matrix.identity(self.dim), subdivide=False)
+        # another option:
+        #        1/2*jacobian(jacobian(self.potential, self.X.list()), self.X.list())
+        return wglKRON
+    
+    def create_barycentric_node_coordinates(self):
+        barycenter = vector([0]*self.dim)
+        for node in self.nodes:
+            vnode = vector(self.node_coordinates[node])
+            barycenter += vnode
+        barycenter = barycenter / len(self.nodes)
+        barycentric_node_coordinates = {}
+        for node in self.nodes:
+            vnode = vector(self.node_coordinates[node])
+            vnode = vnode - barycenter
+            barycentric_node_coordinates[node] = tuple(vnode)
+        return barycentric_node_coordinates
+
+    def create_barycentric_rotations(self):
+        # OUTPUT: a list of vectors. Each vector has length n*d
+        #         infinitesimal rotations in the right nullspace of self.rigidity_matrix_at_p
+        rotations = []
+        for i in range(self.dim):
+            for j in range(self.dim):
+                if j>i: # one rotation for each upper triangular entry, skew-symm matrix(3,3,[0,1,0, -1,0,0, 0,0,0])
+                    u = [0]*(len(self.nodes)*self.dim)
+                    for node in self.nodes:
+                        indices = self.node_indices[node]
+                        # extract the jth coordinate, and put it in the ith coordinate
+                        u[indices[i]] = self.barycentric_node_coordinates[node][j]
+                        # extract the ith coordinate, and put -it in the jth coordinate
+                        u[indices[j]] = -(self.barycentric_node_coordinates[node][i])
+                    u = vector(self.ring_choice,u)
+                    if self.orthonormal:
+                        u = u / u.norm()
+                    rotations.append(u)
+        return rotations
+    
+    def create_right_nullspace(self):
+        ans = (self.rigidity_matrix_at_p).change_ring(self.ring_choice).right_kernel_matrix()
+        return ans
+    
+    def create_barycentric_flexes(self):
+        # OUTPUT: a list of vectors. Each vector has length n*d,
+        #         in the right nullspace of self.rigidity_matrix_at_p, not a translation nor a rotation.
+        if not self.A0created:
+            self.create_A0() # also creates self.A
+        flexes = []
+        nullspace = self.right_nullspace
+        self.barycentric_rotations = self.create_barycentric_rotations()
+        rigid_motions = matrix(self.ring_choice,self.barycentric_rotations + self.translations)
+        rigid_motions = self.gs(rigid_motions) # my own version of gram schmidt
+        for v in nullspace:
+            v = vector(self.ring_choice,v)
+            for b in rigid_motions:
+                b = vector(self.ring_choice,b)
+                v -= b.dot_product(v)*b / b.dot_product(b)
+            for b in flexes:
+                b = vector(self.ring_choice,b)
+                v -= b.dot_product(v)*b / b.dot_product(b)
+            if v.norm() > self.tolerance:
+                flexes.append(v)
+        self.barycentric_flexes = flexes
+        return flexes
+    
+    def create_leftnullspace(self):
+        leftnull = (((self.rigidity_matrix_at_p).T).change_ring(self.ring_choice).right_kernel_matrix()).rows()
+        return leftnull
+    
+    def create_stress_matrices(self):
+        omega = self.get_stress_matrix()
+        stress_matrices = []
+        for w in self.leftnullspace:
+            subz = {}
+            for e in self.edges:
+                ind = self.edge_indices[e]
+                subz[var('w%s%s'%e)] = w[ind] # in general we will need a linear combination, or -1 times this if 1-dimensional leftnull
+            mat = omega.subs(subz)
+            stress_matrices.append(mat)
+        return stress_matrices
+    
+    
+    
+    
+    
+    
+    
+    
+#### OLDER CODE BELOW
+    
+    def get_new_node_coordinates(self,pnew):
+        # OUTPUT a dictionary of node coordinates like self.node_coordinates, but for "pnew"
+        pnew_node_coordinates = {}
+        for node in self.nodes:
+            indices = self.node_indices[node]
+            coords = []
+            for ind in indices:
+                coords.append( pnew[ind] )
+            pnew_node_coordinates[node] = tuple(coords)
+        return pnew_node_coordinates
+
+    def satisfies_constraints(self,pnew,tolerance):
+        # OUTPUT: True or False, depending on if pnew satifies the constraints
+        # ASSUME: for now that we just have rigid bars, no cables or struts
+        okay = True
+        subz = self.create_subz(pnew)
+        # now subz is created
+        for edge in self.edges:
+            eqn = self.bar_constraints[edge]
+            eqn = eqn.subs(subz)
+            ans = abs(eqn)
+            #print ans
+            if ans > tolerance:
+                okay = False
+        return okay
+    
+    def create_subz(self,pnew):
+        subz = {}
+        for node in self.nodes:
+            indices = self.node_indices[node]
+            for k,ind in enumerate(indices):
+                subz[var('x%s%s'%(node,k+1))] = pnew[ind] # needed a k+1 here
+        return subz
+
+    # The user can "set_location" on each node separately, or import coordinates from some VarTruss whose locations have been fixed.
+    def set_location(self, node, coords): # coords = (2,3,-0.3) of the correct dimension
+        if len(coords) != self.dim:
+            raise NameError('...your dimensions are off.')
+        if node not in self.nodes:
+            raise NameError('...that node does not exist')
+        for i in range(self.dim):
+            #self.A0 = self.A0( { var('x%s%s'%(node,i+1)) :coords[i]} ) # variables x11,x12,x13 and onwards
+            #self.A = self.A( { var('x%s%s'%(node,i+1)) :coords[i]} )
+            self.node_coordinates[node] = coords
+    def import_coordinates(self, node_coord_dictionary):
+        # "node_coord_dictionary" should literally be from VarTruss
+        self.node_coordinates = node_coord_dictionary
+
+    def fix_nodes(self, fixed_nodes):
+        # "fixed_nodes" should be [1,3,4] a list of the nodes to be fixed
+        # then we delete columns from "self.A0" to create "self.A"
+        #     and also we give the "self.unfixed_node_indices" for indices of "self.A"
+        # LATER: should allow fixing the node in each coordinate separately, and...
+        #            what about allowing motion only in some fixed plane? and along some fixed line in space?
+        for node in fixed_nodes:
+            if node not in self.fixed_nodes:
+                self.fixed_nodes.append(node)
+        if not self.A0created:
+            self.create_A0()
+        index = 0 # keeps track of how many nodes are leftover, so we can label column indices in "unfixed_node_indices"
+        cols = []
+        for node in nodes:
+            if node not in fixed_nodes:
+                cols += self.node_indices[node]
+                self.unfixed_node_indices[node] = [self.dim*index + j for j in range(self.dim)]
+                index += 1
+            else:
+                self.unfixed_node_indices[node] = [] # this is a fixed node!
+        self.A = self.A0.matrix_from_columns(cols)
+
+    def compute_mechanisms(self, orthonormal=False):
+        if not self.A0created:
+            self.create_A0()
+        # compute the right nullspace of "self.A"
+        RK = self.A.right_kernel_matrix()
+        mechanisms = RK.rows() # should be a list of tuples, each tuple is the entire row
+        self.number_mechanisms = len(mechanisms)
+        for i,mechanism in enumerate(mechanisms):
+            self.mechanisms[i] = {}
+            for node in nodes:
+                if node in self.fixed_nodes:
+                    self.mechanisms[i][node] = self.dim*[0]
+                else:
+                    indices = self.unfixed_node_indices[node]
+                    force = [mechanism[j] for j in indices]
+                    self.mechanisms[i][node] = force
+        self.plot_mechanisms()
+
+    def plot(self, before=True, origin=True):
+        plt = Graphics()
+        if self.dim==2:
+            plt.set_aspect_ratio(1)
+        if origin:
+            plt += point(self.dim*[0],size=1)
+        if before:
+            edgecolor = 'darkblue'
+            nodecolor = 'grey'
+        else:
+            edgecolor = 'darkblue'
+            nodecolor = 'black'
+        for edge in self.edges:
+            coords0 = self.node_coordinates[edge[0]]
+            coords1 = self.node_coordinates[edge[1]]
+            plt += line([coords0,coords1], color=edgecolor, thickness=5, alpha=0.4)
+        for node in self.nodes:
+            coords = self.node_coordinates[node]
+            if self.dim==2:
+                #plt += point(coords, size=30, color=nodecolor)
+                if node in self.fixed_nodes:
+                    plt += text(str(node), coords, fontsize=20, color='red')
+                else:
+                    plt += text(str(node), coords, fontsize=20, color='black')
+            if self.dim==3:
+                #plt += point(coords, size=5, color=nodecolor)
+                if node in self.fixed_nodes:
+                    plt += text3d(str(node), coords, fontsize=20, color='red')
+                else:
+                    plt += text3d(str(node), coords, fontsize=20)
+        return plt #self.before = plt
+    
+    def plot_rigid_motions(self):
+        if not self.A0created:
+            self.create_A0()
+        self.plot()
+        plt = self.before
+        arrowwidth = 0.8
+        if self.dim==2:
+            plt.set_aspect_ratio(1)
+            arrowwidth = 2
+        total_colors = len(self.rigid_motions)
+        color_count = 0
+        for u in self.translation_sections: # add an arrow
+            for node in self.nodes:
+                coords = self.node_coordinates[node]
+                motion = vector(u[node])
+                if motion.norm()!=0:
+                    end_coords = list( vector(coords) + self.plot_arrow_scale*motion )
+                    plt += arrow(coords, end_coords, width=arrowwidth, color=rainbow(total_colors+1)[color_count])
+            color_count += 1
+        for u in self.rotation_sections: # add an arrow
+            for node in self.nodes:
+                coords = self.node_coordinates[node]
+                motion = vector(u[node])
+                if motion.norm()!=0:
+                    end_coords = list( vector(coords) + self.plot_arrow_scale*motion )
+                    plt += arrow(coords, end_coords, width=arrowwidth, color=rainbow(total_colors+1)[color_count])
+            color_count += 1
+        self.rigid_motions_plot = plt
+    
+    def plot_flexes(self):
+        if not self.A0created:
+            self.create_A0()
+        self.plot()
+        plt = self.before
+        arrowwidth = 0.8
+        if self.dim==2:
+            plt.set_aspect_ratio(1)
+            arrowwidth = 2
+        total_colors = len(self.flexes)
+        color_count = 0
+        for u in self.flex_sections:
+            for node in self.nodes:
+                coords = self.node_coordinates[node]
+                motion = vector(u[node])
+                if motion.norm()!=0:
+                    end_coords = list( vector(coords) + self.plot_arrow_scale*motion )
+                    plt += arrow(coords, end_coords, width=arrowwidth, color=rainbow(total_colors)[color_count])
+            color_count += 1
+        self.flexes_plot = plt
+
+    def plot_mechanisms(self):
+        if not self.A0created:
+            self.create_A0()
+        self.plot()
+        plt = self.before
+        arrowwidth = 0.8
+        if self.dim==2:
+            plt.set_aspect_ratio(1)
+            arrowwidth = 2
+        total_colors = len(self.flexes) + len(self.rigid_motions)
+        color_count = 0
+        for u in self.flex_sections:
+            for node in self.nodes:
+                coords = self.node_coordinates[node]
+                motion = vector(u[node])
+                if motion.norm()!=0:
+                    end_coords = list( vector(coords) + self.plot_arrow_scale*motion )
+                    plt += arrow(coords, end_coords, width=arrowwidth, color=rainbow(total_colors)[color_count])
+            color_count += 1
+        for u in self.translation_sections: # add an arrow
+            for node in self.nodes:
+                coords = self.node_coordinates[node]
+                motion = vector(u[node])
+                if motion.norm()!=0:
+                    end_coords = list( vector(coords) + self.plot_arrow_scale*motion )
+                    plt += arrow(coords, end_coords, width=arrowwidth, color=rainbow(total_colors+1)[color_count])
+            color_count += 1
+        for u in self.rotation_sections: # add an arrow
+            for node in self.nodes:
+                coords = self.node_coordinates[node]
+                motion = vector(u[node])
+                if motion.norm()!=0:
+                    end_coords = list( vector(coords) + self.plot_arrow_scale*motion )
+                    plt += arrow(coords, end_coords, width=arrowwidth, color=rainbow(total_colors+1)[color_count])
+            color_count += 1
+        self.mechanism_plot = plt
+
+
+
+
+
+
